@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+runtime/
+memory/
+.workflow/
+.ccw/
+.env
+.env.*
+!.env.example
+凭据.txt
+credentials.txt
+*.pem
+*.key
+*.p12
+*.pfx
+ChatGPT-调研 ChatGPT Skill-20260915-0313.md
