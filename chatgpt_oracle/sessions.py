@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .oracle_protocol import BOOTSTRAP_VERSION, MEMORY_POLICY, ORIGIN_MARKER, PROTOCOL_VERSION
+
 
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
@@ -39,6 +41,9 @@ class ConversationSession:
     last_used_at: str = ""
     expires_at: str = ""
     closed_at: str | None = None
+    tab_cleanup_pending: bool = False
+    oracle_protocol_version: str | None = None
+    oracle_bootstrap_version: str | None = None
 
     @classmethod
     def create(cls, session_id: str, ttl_seconds: float) -> "ConversationSession":
@@ -48,6 +53,8 @@ class ConversationSession:
             created_at=_iso(now),
             last_used_at=_iso(now),
             expires_at=_iso(now + timedelta(seconds=ttl_seconds)),
+            oracle_protocol_version=PROTOCOL_VERSION,
+            oracle_bootstrap_version=BOOTSTRAP_VERSION,
         )
 
     def touch(self, ttl_seconds: float) -> None:
@@ -71,6 +78,14 @@ class ConversationSession:
             "last_used_at": self.last_used_at,
             "expires_at": self.expires_at,
             "closed_at": self.closed_at,
+            "oracle_protocol": {
+                "configured_version": self.oracle_protocol_version,
+                "configured_bootstrap_version": self.oracle_bootstrap_version,
+                "origin_marker": ORIGIN_MARKER if self.oracle_protocol_version else None,
+                "memory_policy": MEMORY_POLICY,
+                # Configuring a logical Session does not prove a Web send.
+                "bootstrap": {"state": "unknown", "version": None, "task_id": None, "user_message_id": None, "verified_at": None},
+            },
         }
         if tab_open is not None:
             value["tab_open"] = tab_open
@@ -180,6 +195,7 @@ class SessionStore:
                 continue
             session.state = "DEAD"
             session.closed_at = _iso(now)
+            session.tab_cleanup_pending = True
             self.save(session)
             expired.append(session)
         return expired
@@ -190,6 +206,7 @@ class SessionStore:
             raise KeyError(f"session not found: {session_id}")
         session.state = "DEAD"
         session.closed_at = _iso(_now())
+        session.tab_cleanup_pending = True
         self.save(session)
         return session
 

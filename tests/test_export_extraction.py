@@ -667,6 +667,7 @@ def test_file_card_download_uses_and_closes_a_temporary_tab(tmp_path, monkeypatc
             return b"file bytes", "application/octet-stream", "attachment"
 
         monkeypatch.setattr(browser, "start", start)
+        monkeypatch.setattr(browser, "_new_page", browser._context.new_page)
         monkeypatch.setattr(browser, "_page_has_composer", has_composer)
         monkeypatch.setattr(browser, "_download_file_download_endpoint", no_direct_source)
         monkeypatch.setattr(browser, "_load_all_rendered_messages", load)

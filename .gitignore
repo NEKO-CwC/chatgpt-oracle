@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+build/
+dist/
+*.egg-info/
+delivery/
 runtime/
 memory/
 .workflow/
@@ -15,4 +19,5 @@ credentials.txt
 *.key
 *.p12
 *.pfx
-ChatGPT-调研 ChatGPT Skill-20260915-0313.md
+/ChatGPT-*.md
+/login.png

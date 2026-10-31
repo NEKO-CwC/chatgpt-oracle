@@ -20,10 +20,12 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult
 
-from .config import Settings
+from .config import Settings, is_tailscale_address
+from .gemini_accounts import GeminiAccountState
 from .browser import BrowserNeedsUserAction, BrowserTaskError
 from .jobs import ExportRequestError, JobManager
 from .models import public_job
+from .oracle_protocol import protocol_capabilities
 from .scheduler import IdempotencyConflict, SchedulerBusy
 from .exports import (
     AttachmentUnavailable,
@@ -36,7 +38,7 @@ from .exports import (
 from .uploads import UploadError, UploadStore
 from .file_store import FileTransferError
 
-logging.basicConfig(stream=sys.stderr, level=os.getenv("CHATGPT_ORACLE_LOG_LEVEL", "INFO"))
+logging.basicConfig(stream=sys.stderr, level=os.getenv(f"{os.getenv('ORACLE_PROVIDER', 'chatgpt').upper()}_ORACLE_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("chatgpt_oracle")
 _TUS_VERSION = "1.0.0"
 _TUS_MIME_TYPE = "application/offset+octet-stream"
@@ -85,7 +87,7 @@ def _configure_persistent_logging() -> None:
     log_dir = settings.root / "runtime" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     handler = logging.handlers.RotatingFileHandler(
-        log_dir / f"chatgpt-oracle-{os.getpid()}.log",
+        log_dir / f"{settings.provider}-oracle-{os.getpid()}.log",
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
         encoding="utf-8",
@@ -104,9 +106,9 @@ settings.validate_http_security()
 manager = JobManager(settings, export_owner=settings.transport != "stdio")
 upload_store = manager.uploads
 mcp = FastMCP(
-    "chatgpt-oracle",
+    f"{settings.provider}-oracle",
     instructions=(
-        "Delegate external research and second opinions to the user's logged-in ChatGPT Web profile. "
+        f"Delegate external research and second opinions to the user's logged-in {manager.policy.title} Web profile. "
         "Use semantic task tools; never expose cookies or browser control primitives."
     ),
     host=settings.host,
@@ -119,6 +121,29 @@ mcp = FastMCP(
         allowed_hosts=list(settings.allowed_hosts),
     ),
 )
+
+
+def _provider_tool():
+    def register(function):
+        name = function.__name__
+        if settings.provider == "gemini":
+            if name in {"chatgpt_export_attachment_handle", "chatgpt_file_download_start"}:
+                return function
+            name = name.replace("chatgpt_", "gemini_", 1)
+            function.__doc__ = (function.__doc__ or "").replace("ChatGPT", "Gemini")
+        return mcp.tool(name=name)(function)
+    return register
+
+
+def _service_protocol_capabilities():
+    value = protocol_capabilities()
+    if settings.provider == "gemini":
+        value["account_page_recovery"] = {
+            "max_refreshes_per_operation": 0,
+            "before_send_only": True,
+            "login_logout_captcha": "human",
+        }
+    return value
 
 
 def _export_proxy_sync(action: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -178,25 +203,26 @@ async def _manager_export_action(
     action: str, payload: dict[str, Any], *, owner: JobManager | None = None
 ) -> dict[str, Any]:
     action_manager = owner or manager
+    settings = action_manager.settings
     await action_manager.start()
     if action == "start":
-        return await manager.export_start(**payload)
+        return await action_manager.export_start(**payload)
     if action == "status":
-        return await manager.export_status(str(payload["session_id"]), str(payload["export_id"]))
+        return await action_manager.export_status(str(payload["session_id"]), str(payload["export_id"]))
     if action == "page":
-        return await manager.export_page(**payload)
+        return await action_manager.export_page(**payload)
     if action == "cancel":
-        return await manager.export_cancel(str(payload["session_id"]), str(payload["export_id"]))
+        return await action_manager.export_cancel(str(payload["session_id"]), str(payload["export_id"]))
     if action == "attachment-handle":
-        return await manager.export_attachment_handle(**payload)
+        return await action_manager.export_attachment_handle(**payload)
     if action == "release":
-        return await manager.export_release(str(payload["session_id"]), str(payload["export_id"]))
+        return await action_manager.export_release(str(payload["session_id"]), str(payload["export_id"]))
     if action == "legacy":
-        return await manager.export(**payload)
+        return await action_manager.export(**payload)
     if action == "session-status":
-        return await manager.session_status(str(payload["session_id"]))
+        return await action_manager.session_status(str(payload["session_id"]))
     if action == "session-close":
-        return await manager.session_close(str(payload["session_id"]))
+        return await action_manager.session_close(str(payload["session_id"]))
     if action == "file-upload-start":
         session_id = str(payload["session_id"])
         if action_manager.sessions.get(session_id) is None:
@@ -206,6 +232,7 @@ async def _manager_export_action(
         if size < 0 or size > settings.file_store_max_file_bytes:
             raise FileTransferError("FILE_TOO_LARGE", "file size is outside the supported range", 413)
         mime_type = str(payload.get("mime_type") or "application/octet-stream")
+        action_manager.policy.validate_file(filename, mime_type, size)
         metadata = {
             "session_id": session_id,
             "filename": filename,
@@ -294,7 +321,7 @@ async def _export_call(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         return {"accepted": False, "error_code": "EXPORT_ERROR", "error": str(exc)}
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_submit(
     mode: str,
     prompt: str,
@@ -303,7 +330,7 @@ async def chatgpt_submit(
     quality: str = "auto",
     reasoning_effort: str | None = None,
     allow_downgrade: bool = False,
-    on_busy: str = "reject",
+    on_busy: str = "queue",
     request_id: str | None = None,
     upload_ids: list[str] | None = None,
     files: list[dict[str, str]] | None = None,
@@ -336,14 +363,14 @@ async def chatgpt_submit(
         return {"accepted": False, "error_code": "INVALID_REQUEST", "error": str(exc)}
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_status(task_id: str) -> dict[str, Any]:
     """Return the durable state of a task without blocking for completion."""
     await manager.start()
     return manager.public(task_id)
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_result(task_id: str, delivery: str = "legacy") -> dict[str, Any]:
     """Return the completed Markdown result and source links, or readiness information."""
     await manager.start()
@@ -366,13 +393,39 @@ async def chatgpt_result(task_id: str, delivery: str = "legacy") -> dict[str, An
                 "result_id": page["result_id"],
                 "total_bytes": page["total_bytes"],
                 "sha256": page["sha256"],
-                "read_tool": "chatgpt_result_page",
+                "read_tool": f"{settings.provider}_result_page",
             }
     response["result_markdown"] = result if response["ready"] else None
     return response
 
 
-@mcp.tool()
+@_provider_tool()
+async def chatgpt_diagnostics(task_id: str) -> dict[str, Any]:
+    """Return a task's bounded page evidence: visible runtime alerts, failed
+    backend requests and console errors captured around the turn. Rows are
+    scrubbed (no hosts, tokens or prompt text) and persist after tab cleanup."""
+    await manager.start()
+    job = manager.get(task_id)
+    stored: list[dict[str, Any]] = []
+    path = settings.jobs_dir / "diagnostics" / f"{task_id}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            stored = [event for event in payload.get("events", []) if isinstance(event, dict)]
+    except (OSError, ValueError):
+        pass
+    return {
+        "task_id": task_id,
+        "state": job.state,
+        "error_code": job.error_code,
+        "runtime_recovery_attempts": job.runtime_recovery_attempts,
+        "runtime_recovery_actions": job.runtime_recovery_actions,
+        "page_probe_events": list(job.page_probe_events)[-60:],
+        "submission_events": stored[-48:],
+    }
+
+
+@_provider_tool()
 async def chatgpt_result_page(
     session_id: str,
     result_id: str,
@@ -401,7 +454,7 @@ async def chatgpt_result_page(
         )
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_export(
     task_id: str | None = None,
     conversation_url: str | None = None,
@@ -409,7 +462,7 @@ async def chatgpt_export(
     scope: str = "recent",
     count: int = 10,
     request_id: str | None = None,
-    on_busy: str = "reject",
+    on_busy: str = "queue",
 ) -> dict[str, Any]:
     """Legacy inline export; use the paged export tools for long conversations."""
     return await _export_call(
@@ -426,7 +479,7 @@ async def chatgpt_export(
     )
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_export_start(
     session_id: str | None = None,
     task_id: str | None = None,
@@ -434,7 +487,7 @@ async def chatgpt_export_start(
     scope: str = "all",
     count: int = 10,
     request_id: str | None = None,
-    on_busy: str = "reject",
+    on_busy: str = "queue",
 ) -> dict[str, Any]:
     """Start a session-bound immutable export snapshot and return its export_id."""
     return await _export_call(
@@ -451,19 +504,19 @@ async def chatgpt_export_start(
     )
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_export_status(session_id: str, export_id: str) -> dict[str, Any]:
     """Return lifecycle state, completeness evidence, view sizes, and hashes."""
     return await _export_call("status", {"session_id": session_id, "export_id": export_id})
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_export_cancel(session_id: str, export_id: str) -> dict[str, Any]:
     """Cancel a queued or running export and wait briefly for its browser slot to be released."""
     return await _export_call("cancel", {"session_id": session_id, "export_id": export_id})
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_export_page(
     session_id: str,
     export_id: str,
@@ -485,7 +538,7 @@ async def chatgpt_export_page(
     return CallToolResult(content=[], structuredContent=result)
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_export_attachment_handle(
     session_id: str,
     export_id: str,
@@ -498,13 +551,13 @@ async def chatgpt_export_attachment_handle(
     )
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_export_release(session_id: str, export_id: str) -> dict[str, Any]:
     """Release a READY snapshot. Use chatgpt_export_cancel for queued or running work."""
     return await _export_call("release", {"session_id": session_id, "export_id": export_id})
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_file_upload_start(
     session_id: str,
     filename: str,
@@ -527,7 +580,7 @@ async def chatgpt_file_upload_start(
     )
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_file_download_start(
     session_id: str,
     export_id: str,
@@ -546,7 +599,7 @@ async def chatgpt_file_download_start(
     )
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_transfer_status(session_id: str, transfer_id: str) -> dict[str, Any]:
     """Read a tus upload's durable offset and its file_ref after byte verification."""
     return await _export_call(
@@ -554,7 +607,7 @@ async def chatgpt_transfer_status(session_id: str, transfer_id: str) -> dict[str
     )
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_transfer_cancel(session_id: str, transfer_id: str) -> dict[str, Any]:
     """Cancel an unfinished file upload without releasing an already completed file."""
     return await _export_call(
@@ -562,19 +615,19 @@ async def chatgpt_transfer_cancel(session_id: str, transfer_id: str) -> dict[str
     )
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_file_info(session_id: str, file_ref: str) -> dict[str, Any]:
     """Return verified metadata and the authenticated content route for a READY file_ref."""
     return await _export_call("file-info", {"session_id": session_id, "file_ref": file_ref})
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_file_release(session_id: str, file_ref: str) -> dict[str, Any]:
     """Release one session-scoped file_ref after its active readers finish."""
     return await _export_call("file-release", {"session_id": session_id, "file_ref": file_ref})
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_resume(
     session_id: str,
     prompt: str,
@@ -583,7 +636,7 @@ async def chatgpt_resume(
     model: str | None = None,
     reasoning_effort: str | None = None,
     allow_downgrade: bool | None = None,
-    on_busy: str = "reject",
+    on_busy: str = "queue",
     request_id: str | None = None,
     upload_ids: list[str] | None = None,
     files: list[dict[str, str]] | None = None,
@@ -614,7 +667,7 @@ async def chatgpt_resume(
         return {"accepted": False, "error_code": "SESSION_ERROR", "error": str(exc)}
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_session_status(session_id: str) -> dict[str, Any]:
     """Return a named session's URL, liveness deadline and tab presence."""
     try:
@@ -626,17 +679,17 @@ async def chatgpt_session_status(session_id: str) -> dict[str, Any]:
         return {"accepted": False, "error_code": "SESSION_ERROR", "error": str(exc)}
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_session_create(session_id: str | None = None) -> dict[str, Any]:
     """Create or return a durable named session before the first submit."""
     try:
         await manager.start()
-        return manager.sessions.create(session_id).public(tab_open=False)
+        return manager.public_session(manager.sessions.create(session_id), tab_open=False)
     except ValueError as exc:
         return {"accepted": False, "error_code": "SESSION_ERROR", "error": str(exc)}
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_session_close(session_id: str) -> dict[str, Any]:
     """Mark a session dead and close only its ChatGPT tab."""
     try:
@@ -650,14 +703,14 @@ async def chatgpt_session_close(session_id: str) -> dict[str, Any]:
         return {"accepted": False, "error_code": "SESSION_ERROR", "error": str(exc)}
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_sessions(include_dead: bool = True) -> dict[str, Any]:
     """List local session IDs without exposing browser credentials or content."""
     await manager.start()
     return {"sessions": await manager.session_list(include_dead=include_dead)}
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_continue(
     task_id: str,
     prompt: str,
@@ -665,7 +718,7 @@ async def chatgpt_continue(
     model: str | None = None,
     reasoning_effort: str | None = None,
     allow_downgrade: bool | None = None,
-    on_busy: str = "reject",
+    on_busy: str = "queue",
     request_id: str | None = None,
     upload_ids: list[str] | None = None,
     files: list[dict[str, str]] | None = None,
@@ -693,15 +746,15 @@ async def chatgpt_continue(
         return {"accepted": False, "error_code": exc.code, "error": str(exc)}
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_cancel(task_id: str) -> dict[str, Any]:
     """Cancel a queued or running task."""
     await manager.start()
     job = await manager.cancel(task_id)
-    return public_job(job)
+    return manager.public(job.id) if settings.provider == "gemini" else public_job(job)
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_takeover(task_id: str) -> dict[str, Any]:
     """Explain the manual action required for a blocked task; never automates authentication or CAPTCHA."""
     await manager.start()
@@ -715,19 +768,71 @@ async def chatgpt_takeover(task_id: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_browser_status() -> dict[str, Any]:
     """Start or inspect the dedicated browser profile and report login readiness."""
     await manager.start()
-    return await manager.browser.browser_status()
+    try:
+        return await manager.browser_status()
+    except SchedulerBusy as exc:
+        return exc.info.as_dict()
 
 
-@mcp.tool()
+@_provider_tool()
 async def chatgpt_capabilities(scope: str = "browser") -> dict[str, Any]:
     """Discover service file-transfer limits or visible ChatGPT model options."""
     if scope == "service":
         return {
-            "api_revision": 3,
+            "api_revision": 4,
+            "provider": settings.provider,
+            "http_auth": {
+                "tailscale_direct_without_bearer": bool(settings.tailscale_ips),
+                "tailscale_local_ips": list(settings.tailscale_ips),
+                "other_connections": "bearer" if settings.bearer_token else (
+                    "denied" if settings.tailscale_ips else "unconfigured"
+                ),
+            },
+            "provider_capabilities": {
+                "quality_values": list(manager.policy.qualities),
+                "default_quality": dict(manager.policy.defaults),
+                "zip_inputs": settings.provider == "chatgpt",
+                "general_file_outputs": manager.policy.source_attachments,
+                "text_snapshot_scope": "rendered_text" if settings.provider == "gemini" else "conversation",
+                "generation_model_verification": "unavailable" if settings.provider == "gemini" else "provider_selection",
+                "upstream_concurrency_verified": settings.provider == "chatgpt",
+                "binary_image_delivery": False if settings.provider == "gemini" else None,
+                **({"accounts": {
+                    "configured_indexes": list(settings.gemini_account_indexes),
+                    "configured_preferred_index": settings.gemini_preferred_account_index,
+                    "automatic_pre_send_failover": True,
+                    "continuation_switch": "client_context_rebuild",
+                    "context_required_error": "ACCOUNT_CONTEXT_REQUIRED",
+                    "same_account_conversation_urls": True,
+                    "selection_tool": "gemini_account_select",
+                    "selection_scope": "new_sessions",
+                    "strict_selection_default": True,
+                    "reset_to_automatic": {"account_index": None},
+                    "explicit_selection": GeminiAccountState.explicit_selection(
+                        GeminiAccountState(settings.jobs_dir / "account-preference.json").read()),
+                }} if settings.provider == "gemini" else {}),
+            },
+            "oracle_protocol": _service_protocol_capabilities(),
+            "browser": {"profiles": 1, "max_tabs": 4, "concurrent_operations": 4, "max_sessions": 4, "operations_per_session": 1, "admission": "per_session_fifo", "tabs_retained_until": "session_close_or_expiry",
+                        "pool_scope": "shared_profile" if settings.shared_browser else "provider",
+                        "shared_providers": ["chatgpt", "gemini"] if settings.shared_browser else [settings.provider]},
+            "turn_receipts": {"enabled": True, "completion": "matched_current_turn", "cancel_interrupts_reads": True, "stop_verification_reported": True, "nested_message_nodes": "content_and_previous_reply" if settings.provider == "gemini" else "canonical_message_id"},
+            **({"composer_preparation": {
+                "ownership": "task_local_editor_guard", "request_hash": "strict_original_text",
+                "failed_unsent_cleanup": "proven_owned_only", "diagnostics": "durable_pre_input",
+                "native_editor_transactions": True, "cleanup_verification": "editor_model_and_dom",
+            }, "research_workflow": {
+                "completion": "matched_completed_report", "start_intent": "durable_one_use",
+                "observed_tool_selects_wait_budget": True, "unknown_surface": "bounded_wait",
+                "native_inner_documents": "same_origin_bounded_read_and_controls",
+                "report_evidence_in_status": True,
+            }} if settings.provider == "chatgpt" else {}),
+            "browser_diagnostics": {"admission": "independent_temporary_session", "busy_error": "BROWSER_DIAGNOSTIC_BUSY", "borrows_retained_session": False},
+            "wait_budgets_seconds": {mode: settings.timeout_seconds(mode) for mode in ("consult", "critic", "research")},
             "file_storage": "temporary",
             "public_base_url_configured": settings.public_base_url is not None,
             "upload": {
@@ -746,21 +851,43 @@ async def chatgpt_capabilities(scope: str = "browser") -> dict[str, Any]:
                 "storage_ttl_seconds": settings.file_store_ttl_seconds,
             },
             "result_pages": {"max_response_bytes": 12 * 1024, "enabled": True},
-            "source_attachment_materialization": {"enabled": True},
+            "source_attachment_materialization": {"enabled": manager.policy.source_attachments},
         }
     if scope != "browser":
         return {"accepted": False, "error_code": "INVALID_SCOPE", "error": "scope must be browser or service"}
     await manager.start()
-    return asdict(await manager.browser.capabilities())
+    try:
+        return asdict(await manager.browser_capabilities())
+    except SchedulerBusy as exc:
+        return exc.info.as_dict()
 
 
-@mcp.tool()
+if settings.provider == "gemini":
+    @mcp.tool(name="gemini_account_select")
+    async def gemini_account_select(account_index: int | None = None, strict: bool = True) -> dict[str, Any]:
+        """Select a logged-in Gemini URL index for subsequent NEW Sessions.
+
+        account_index=0 selects /u/0/app, 1 selects /u/1/app. strict=true
+        prevents automatic account fallback; strict=false allows fallback when
+        that account lacks the requested model or has reached a limit. Passing
+        null clears this explicit override and restores automatic routing.
+        This does not log in, navigate an existing Session, move its context or
+        replay a pending question. Verify the new task's actual account_index.
+        """
+        try:
+            return {"accepted": True, **await manager.browser.select_account(account_index, strict=strict)}
+        except (ValueError, BrowserTaskError) as exc:
+            return {"accepted": False, "error_code": getattr(exc, "code", "INVALID_ACCOUNT_SELECTION"), "error": str(exc),
+                    "configured_indexes": list(settings.gemini_account_indexes)}
+
+
+@_provider_tool()
 async def chatgpt_health() -> dict[str, Any]:
     """Return service configuration and recoverable task counts without exposing secrets."""
     await manager.start()
     jobs = manager.store.all()
     return {
-        "service": "chatgpt-oracle",
+        "service": f"{settings.provider}-oracle",
         "version": "0.1.0",
         "transport": settings.transport,
         "host": settings.host,
@@ -780,13 +907,32 @@ async def chatgpt_health() -> dict[str, Any]:
 
 
 class AuthHealthMiddleware:
-    """Minimal bearer-token gate around the MCP ASGI app."""
+    """Bearer gate with an explicit direct-Tailscale exception for all routes."""
 
-    def __init__(self, app: Any, token: str | None, uploads: UploadStore, manager: JobManager | None = None):
+    def __init__(
+        self, app: Any, token: str | None, uploads: UploadStore,
+        manager: JobManager | None = None, *, tailscale_ips: tuple[str, ...] | None = None,
+    ):
         self.app = app
         self.token = token
         self.uploads = uploads
         self.manager = manager
+        addresses = tailscale_ips if tailscale_ips is not None else (
+            manager.settings.tailscale_ips if manager else ()
+        )
+        if any(not is_tailscale_address(value) for value in addresses):
+            raise ValueError("tailscale_ips must contain exact Tailscale IP addresses")
+        self.tailscale_ips = frozenset(str(ipaddress.ip_address(value)) for value in addresses)
+
+    def _direct_tailscale(self, scope: dict[str, Any]) -> bool:
+        # Both endpoints come from the socket, never Host/Forwarded headers.
+        # Uvicorn must run with proxy_headers=False to preserve the real peer.
+        try:
+            local = str(ipaddress.ip_address(scope["server"][0]))
+            peer = scope["client"][0]
+        except (KeyError, TypeError, IndexError, ValueError):
+            return False
+        return local in self.tailscale_ips and is_tailscale_address(peer)
 
     @staticmethod
     async def _send_json(send: Any, status: int, value: dict[str, Any], *, no_store: bool = False) -> None:
@@ -1168,7 +1314,7 @@ class AuthHealthMiddleware:
             return
         path = scope.get("path", "")
         if path in {"/healthz", "/readyz"}:
-            payload = json.dumps({"ok": True, "service": "chatgpt-oracle"}).encode("utf-8")
+            payload = json.dumps({"ok": True, "service": f"{settings.provider}-oracle"}).encode("utf-8")
             await send({
                 "type": "http.response.start",
                 "status": 200,
@@ -1176,10 +1322,10 @@ class AuthHealthMiddleware:
             })
             await send({"type": "http.response.body", "body": payload})
             return
-        if self.token:
+        if not self._direct_tailscale(scope) and (self.token or self.tailscale_ips):
             headers = {key.decode().lower(): value.decode() for key, value in scope.get("headers", [])}
             expected = f"Bearer {self.token}"
-            if headers.get("authorization") != expected:
+            if not self.token or headers.get("authorization") != expected:
                 await self._send_json(send, 401, {"error": "unauthorized"})
                 return
         if await self._handle_v2_files(scope, receive, send):
@@ -1348,7 +1494,10 @@ def run() -> None:
     import uvicorn
 
     app = AuthHealthMiddleware(mcp.streamable_http_app(), settings.bearer_token, upload_store, manager)
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
+    # Keep Uvicorn startup/bind errors on the configured, scrubbed rotating
+    # handlers. Its default logging config otherwise diverts these errors to
+    # an invisible console in the hidden Windows logon task.
+    uvicorn.run(app, host=settings.host, port=settings.port, log_level="info", proxy_headers=False, log_config=None)
 
 
 if __name__ == "__main__":

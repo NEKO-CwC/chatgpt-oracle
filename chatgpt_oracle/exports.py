@@ -14,6 +14,7 @@ import ctypes
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import shutil
@@ -28,7 +29,10 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urljoin, urlparse
 
+from .oracle_protocol import ORIGIN_MARKER, normalized_text_sha256
+
 MAX_PAGE_RESPONSE_BYTES = 15 * 1024
+logger = logging.getLogger(__name__)
 
 
 class ExportSessionMismatch(ValueError):
@@ -168,6 +172,54 @@ def _normalise_messages(raw: Any) -> list[dict[str, Any]]:
         message["metadata"] = metadata
         result.append(_safe(message))
     return result
+
+
+class _OriginMessageView:
+    """Add receipt evidence without rewriting browser data or expanding spools."""
+
+    def __init__(self, messages: Any, receipts: dict[str, dict[str, Any]], *, allow_unique_text: bool = False):
+        self.messages = messages
+        self.receipts = receipts
+        self.is_message_spool = bool(getattr(messages, "is_message_spool", False))
+        self.unique_receipts: dict[str, dict[str, Any]] = {}
+        if allow_unique_text:
+            # DOM placeholder IDs can be replaced by API UUIDs. A complete
+            # API snapshot may bridge that change only with one exact body
+            # and one confirmed service receipt; repeated content stays unknown.
+            by_hash: dict[str, list[dict[str, Any]]] = {}
+            for receipt in receipts.values():
+                by_hash.setdefault(str(receipt.get("submitted_prompt_sha256")), []).append(receipt)
+            counts = {digest: 0 for digest in by_hash}
+            for message in messages:
+                if message.get("role") == "user":
+                    digest = normalized_text_sha256(str(message.get("text") or ""))
+                    if digest in counts:
+                        counts[digest] += 1
+            self.unique_receipts = {digest: items[0] for digest, items in by_hash.items() if len(items) == counts[digest] == 1}
+
+    def __len__(self):
+        return len(self.messages)
+
+    def __iter__(self):
+        for message in self.messages:
+            item = dict(message)
+            text = str(item.get("text") or "")
+            marker = bool(item.get("role") == "user" and text.splitlines() and text.splitlines()[0].strip() == ORIGIN_MARKER)
+            receipt = self.receipts.get(str(item.get("id"))) if item.get("role") == "user" else None
+            matched = bool(receipt and receipt.get("submitted_prompt_sha256") == normalized_text_sha256(text))
+            evidence = "matched_service_turn_receipt" if matched else None
+            if not matched and item.get("role") == "user":
+                receipt = self.unique_receipts.get(normalized_text_sha256(text))
+                matched = bool(receipt)
+                evidence = "confirmed_service_turn_unique_text" if matched else None
+            item["origin"] = {
+                "source": "service_codex" if matched else "unknown",
+                "marker_present": marker,
+                "evidence": evidence,
+                **({key: value for key, value in receipt.items() if key != "submitted_prompt_sha256"} if matched else {}),
+                **({"export_message_id": item["id"]} if matched else {}),
+            }
+            yield item
 
 
 def recent_turns(messages: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
@@ -409,7 +461,13 @@ class ExportStore:
                 if not candidate.is_dir() or len(parts) != 3 or parts[0] not in {"store", "ingest"} or not parts[1].isdigit():
                     continue
                 if not cls._process_is_running(int(parts[1])):
-                    shutil.rmtree(candidate)
+                    try:
+                        shutil.rmtree(candidate)
+                    except PermissionError:
+                        # Windows temporary directories created by an elevated
+                        # process may be unreadable after a normal-user restart.
+                        # Deferred cleanup must not prevent the broker starting.
+                        logger.warning("Abandoned export store cleanup deferred: %s", candidate.name)
 
     def close(self) -> None:
         self._closing = True
@@ -1226,6 +1284,8 @@ def make_export(
     handles: ExportStore,
     download_url: Callable[[DownloadHandle], str] | None = None,
     create_download_handles: bool = True,
+    origin_receipts: dict[str, dict[str, Any]] | None = None,
+    allow_unique_text_receipts: bool = False,
 ) -> dict[str, Any]:
     """Build a safe manifest + Markdown response from browser extraction data."""
     if scope not in {"recent", "all"}:
@@ -1241,6 +1301,9 @@ def make_export(
     streamed_messages = bool(getattr(raw_messages, "is_message_spool", False))
     messages = raw_messages if streamed_messages else _normalise_messages(raw_messages)
     selected = messages if scope == "all" else recent_turns(messages, count)
+    if origin_receipts is not None:
+        view = _OriginMessageView(selected, origin_receipts, allow_unique_text=allow_unique_text_receipts)
+        selected = view if view.is_message_spool else list(view)
     selected_is_spooled = streamed_messages and scope == "all"
     allowed_ids = {str(item.get("id")) for item in selected}
     attachments: list[dict[str, Any]] = []
