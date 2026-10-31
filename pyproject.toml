@@ -11,6 +11,13 @@ dependencies = [
 
 [project.scripts]
 chatgpt-oracle = "chatgpt_oracle.cli:main"
+gemini-oracle = "chatgpt_oracle.gemini_cli:main"
+
+[tool.setuptools.packages.find]
+include = ["chatgpt_oracle*"]
+
+[tool.setuptools.package-data]
+chatgpt_oracle = ["prompts/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

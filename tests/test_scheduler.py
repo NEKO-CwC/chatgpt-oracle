@@ -12,6 +12,50 @@ from chatgpt_oracle.scheduler import (
 )
 
 
+def test_browser_operations_share_fifo_but_only_their_owner_dispatches(tmp_path: Path) -> None:
+    scheduler = Scheduler(tmp_path)
+    scheduler.enqueue('first','consult',on_busy='queue',retry_after_seconds=1)
+    scheduler.set_state('first','QUEUED')
+    scheduler.enqueue_browser_operation('probe',os.getpid(),'probe-owner')
+    scheduler.enqueue('last','consult',on_busy='queue',retry_after_seconds=1)
+    scheduler.set_state('last','QUEUED')
+    assert not scheduler.reserve_browser_operation('probe',os.getpid(),'probe-owner')
+    assert scheduler.reserve_next(os.getpid(),'worker') == 'first'
+    scheduler.complete('first','COMPLETE')
+    assert scheduler.reserve_next(os.getpid(),'worker') is None
+    assert not scheduler.reserve_browser_operation('probe',os.getpid(),'wrong-owner')
+    assert scheduler.reserve_browser_operation('probe',os.getpid(),'probe-owner')
+    assert scheduler.reserve_next(os.getpid(),'worker') is None
+    scheduler.complete('probe','COMPLETE')
+    assert scheduler.reserve_next(os.getpid(),'worker') == 'last'
+
+
+def test_abandoned_browser_waiter_does_not_block_following_jobs(tmp_path: Path) -> None:
+    scheduler = Scheduler(tmp_path)
+    scheduler.enqueue_browser_operation('dead',0,'dead-owner')
+    scheduler.enqueue('next','consult',on_busy='queue',retry_after_seconds=1)
+    scheduler.set_state('next','QUEUED')
+    assert scheduler.reserve_next(os.getpid(),'worker') == 'next'
+    assert scheduler.status('dead')['scheduler_state'] == 'CANCELLED'
+
+
+def test_cleanup_can_free_tabs_even_when_regular_queue_is_full(tmp_path: Path) -> None:
+    scheduler = Scheduler(tmp_path)
+    scheduler.enqueue('resident', 'consult', on_busy='queue', retry_after_seconds=1, session_id='resident-session')
+    scheduler.set_state('resident', 'QUEUED')
+    assert scheduler.reserve_next(os.getpid(), 'worker') == 'resident'
+    scheduler.complete('resident', 'COMPLETE')
+    for index in range(8):
+        scheduler.enqueue(str(index), 'consult', on_busy='queue', retry_after_seconds=1)
+        scheduler.set_state(str(index), 'QUEUED')
+    scheduler.enqueue_browser_operation(
+        'close-session', os.getpid(), 'cleanup-owner', cleanup=True, session_id='resident-session'
+    )
+    assert scheduler.reserve_browser_operation('close-session',os.getpid(),'cleanup-owner')
+    scheduler.complete('close-session','COMPLETE')
+    assert scheduler.reserve_next(os.getpid(),'worker') == '0'
+
+
 def test_busy_reject_and_fifo_queue(tmp_path: Path) -> None:
     scheduler = Scheduler(tmp_path)
     first = scheduler.enqueue("one", "consult", on_busy="reject", retry_after_seconds=30)

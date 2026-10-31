@@ -1,196 +1,88 @@
-from __future__ import annotations
-
-import asyncio
-import hashlib
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
-from playwright.async_api import async_playwright
 
-from chatgpt_oracle.browser import (
-    ChatGPTBrowser,
-    _attachment_scan_reaches_api_count,
-    default_chrome_executable,
-)
-from chatgpt_oracle.config import Settings
+from chatgpt_oracle.browser import BrowserTaskError
 from chatgpt_oracle.file_store import FileRecord
 from chatgpt_oracle.uploads import InMemoryUpload, UploadMetadata
+from test_browser_controls import picker, run_page
 
 
-def test_upload_files_pass_exact_bytes_through_filechooser_and_input(tmp_path: Path) -> None:
-    executable = default_chrome_executable()
-    if executable is None or not executable.exists():
-        pytest.skip("a local Chrome or Edge executable is required")
-
-    data = b"\x00client payload\xff"
-    metadata = UploadMetadata(
-        upload_id="upl_browser_test",
-        filename="notes.bin",
-        mime_type="application/octet-stream",
-        size=len(data),
-        sha256=hashlib.sha256(data).hexdigest(),
-        created_at=1,
-        expires_at=60,
-    )
-    upload = InMemoryUpload(metadata, data)
-    stored_path = tmp_path / metadata.filename
-    stored_path.write_bytes(data)
-    stored_upload = FileRecord(
-        session_id="agent-a",
-        file_ref="fref_browser_test",
-        filename=metadata.filename,
-        mime_type=metadata.mime_type,
-        size=metadata.size,
-        sha256=metadata.sha256,
-        representation="unknown",
-        provenance="caller_declared",
-        expires_at=metadata.expires_at,
-        path=stored_path,
-    )
-
-    async def run() -> None:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(
-                headless=True,
-                executable_path=str(executable),
-            )
-            try:
-                for chooser_path in (True, False):
-                    for input_file in (upload, stored_upload):
-                        page = await browser.new_page()
-                        await page.set_content(
-                            """
-                            <button data-testid="composer-plus-btn" id="plus">+</button>
-                            <input id="files" type="file" multiple hidden>
-                            <script>
-                              const input = document.querySelector('#files');
-                              document.querySelector('#plus').addEventListener('click', () => {
-                                const action = document.createElement('button');
-                                action.setAttribute('role', 'menuitem');
-                                action.textContent = 'Add files';
-                                action.addEventListener('click', () => input.click());
-                                document.body.appendChild(action);
-                              });
-                              input.addEventListener('change', () => {
-                                for (const file of input.files) {
-                                  const button = document.createElement('button');
-                                  button.textContent = `Remove file ${file.name}`;
-                                  document.body.appendChild(button);
-                                }
-                              });
-                            </script>
-                            """
-                            if chooser_path
-                            else """
-                            <input id="files" type="file" multiple>
-                            <script>
-                              const input = document.querySelector('#files');
-                              input.addEventListener('change', () => {
-                                for (const file of input.files) {
-                                  const button = document.createElement('button');
-                                  button.textContent = `Remove file ${file.name}`;
-                                  document.body.appendChild(button);
-                                }
-                              });
-                            </script>
-                            """
-                        )
-
-                        receipt = await ChatGPTBrowser(Settings.from_env(tmp_path))._upload_files(page, [input_file])
-                        observed = await page.locator("#files").evaluate(
-                            """async input => Promise.all(Array.from(input.files, async file => ({
-                              name: file.name,
-                              type: file.type,
-                              bytes: Array.from(new Uint8Array(await file.arrayBuffer()))
-                            })))"""
-                        )
-                        assert observed == [{
-                            "name": "notes.bin",
-                            "type": "application/octet-stream",
-                            "bytes": list(data),
-                        }]
-                        assert receipt[0]["sha256"] == metadata.sha256
-                        assert receipt[0]["verified"] is True
-                        assert receipt[0]["upload_method"] == ("filechooser" if chooser_path else "input")
-                        await page.close()
-            finally:
-                await browser.close()
-
-    asyncio.run(run())
+def stored_zip(tmp_path: Path) -> FileRecord:
+    path = tmp_path / "probe.zip"
+    path.write_bytes(b"PK\x03\x04fixture")
+    return FileRecord("test", "fref_fixture", path.name, "application/zip", path.stat().st_size,
+                      "fixture-hash", "original", "upload", 9999999999, path)
 
 
-def test_virtualized_attachment_scan_visits_each_message_id(tmp_path: Path) -> None:
-    executable = default_chrome_executable()
-    if executable is None or not executable.exists():
-        pytest.skip("a local Chrome or Edge executable is required")
+@pytest.mark.parametrize("stored", [False, True])
+@pytest.mark.parametrize("remove_label", ["移除 ", "Remove file "])
+def test_zip_upload_uses_generic_input_and_current_visible_hover_controls(tmp_path, stored, remove_label):
+    body = picker() + '''
+      <input type="file" id="generic" multiple aria-label="附加文件">
+      <input type="file" id="image-only" accept="image/*" multiple onchange="window.wrongInput=true">
+      <div hidden><button aria-label="REMOVE_LABELprobe.zip">hidden duplicate</button></div>
+      <style>.file-card .remove {opacity:0;pointer-events:none}.file-card:hover .remove {opacity:1;pointer-events:auto}</style>
+      <div id="cards"></div>
+      <script>
+      document.querySelector('#generic').onchange=event=>{
+        for(const file of event.target.files){
+          const card=document.createElement('div'); card.className='file-card';
+          card.style='position:relative;width:180px;height:80px';
+          const name=document.createElement('span');name.textContent=file.name;card.append(name);
+          const remove=document.createElement('button');remove.className='remove';
+          remove.setAttribute('aria-label','REMOVE_LABEL'+file.name);remove.textContent='x';
+          remove.onclick=()=>card.remove();card.append(remove);document.querySelector('#cards').append(card);
+        }
+      };
+      </script>
+    '''.replace("REMOVE_LABEL", remove_label)
 
-    async def run() -> None:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(
-                headless=True,
-                executable_path=str(executable),
-            )
-            try:
-                page = await browser.new_page()
-                await page.set_content(
-                    """
-                    <div id="thread" style="height: 240px; overflow-y: auto; position: relative">
-                      <div id="spacer" style="height: 7560px; position: relative"></div>
-                    </div>
-                    <script>
-                      const thread = document.querySelector('#thread');
-                      const spacer = document.querySelector('#spacer');
-                      const rowHeight = 120;
-                      function render() {
-                        const first = Math.max(0, Math.floor(thread.scrollTop / rowHeight) - 1);
-                        const count = Math.ceil(thread.clientHeight / rowHeight) + 2;
-                        spacer.replaceChildren(...Array.from({length: count}, (_, offset) => {
-                          const index = Math.min(62, first + offset);
-                          const row = document.createElement('article');
-                          row.dataset.messageId = `message-${index}`;
-                          row.dataset.messageAuthorRole = 'assistant';
-                          row.style.cssText = `position:absolute;top:${index * rowHeight}px;height:${rowHeight}px`;
-                          return row;
-                        }));
-                      }
-                      thread.addEventListener('scroll', render);
-                      render();
-                    </script>
-                    """
-                )
-
-                scan = await ChatGPTBrowser(Settings.from_env(tmp_path))._load_all_rendered_messages(page)
-                assert scan["stable"] is True
-                assert scan["reached_end"] is True
-                assert scan["rendered_message_count"] < 63
-                assert scan["observed_message_id_count"] == 63
-                assert len(scan["observed_message_ids"]) == 63
-                assert set(scan["observed_message_scroll_tops"]) == set(scan["observed_message_ids"])
-                assert _attachment_scan_reaches_api_count(scan, 63) is True
-                await page.close()
-            finally:
-                await browser.close()
-
-    asyncio.run(run())
+    async def check(browser, page):
+        record = stored_zip(tmp_path)
+        upload = record if stored else InMemoryUpload(
+            UploadMetadata("legacy", record.filename, record.mime_type, record.size,
+                           record.sha256, 0, 9999999999), record.path.read_bytes(),
+        )
+        receipts = await browser._upload_files(page, [upload])
+        assert receipts[0]["filename"] == "probe.zip"
+        assert receipts[0]["verified"] is True
+        assert await page.evaluate("window.wrongInput === true") is False
+        assert await page.locator('#generic').evaluate("e=>e.files[0].name") == "probe.zip"
+        await browser._clear_uploaded_files(page, [record.filename])
+        assert await page.locator('#cards .file-card').count() == 0
+        assert await page.evaluate("window.sent") == 0
+    run_page(tmp_path, body, check)
 
 
-def test_attachment_scan_stops_when_scroller_makes_no_progress(tmp_path: Path) -> None:
-    class StuckPage:
-        async def evaluate(self, *_: object) -> dict[str, object]:
-            return {
-                "scroller_count": 1,
-                "original_scroll_top": 0,
-                "scroll_top": 0,
-                "max_scroll": 10000,
-                "client_height": 600,
-                "rendered_message_count": 1,
-                "message_ids": ["message-1"],
-            }
+@pytest.mark.parametrize("method", ["submit", "continue"])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_file_ref_failure_preserves_original_error_and_never_sends(tmp_path, method, cleanup_fails):
+    async def check(browser, page):
+        record = stored_zip(tmp_path)
+        browser._upload_files = AsyncMock(side_effect=BrowserTaskError("original upload failure"))
+        browser._clear_uploaded_files = AsyncMock(
+            side_effect=RuntimeError("secondary cleanup failure") if cleanup_fails else None,
+        )
+        browser._click_send = AsyncMock()
+        with pytest.raises(BrowserTaskError, match="original upload failure"):
+            if method == "submit":
+                await browser.submit("consult", "do not send", quality="extra_high", attachments=[record])
+            else:
+                url = "https://chatgpt.com/c/upload-regression"
+                await page.goto(url)
+                await browser.continue_conversation(url, "do not send", quality="extra_high", attachments=[record])
+        browser._clear_uploaded_files.assert_awaited_once_with(page, [record.filename])
+        browser._click_send.assert_not_awaited()
+        assert await page.evaluate("window.sent") == 0
+    run_page(tmp_path, picker(), check)
 
-    async def run() -> None:
-        scan = await ChatGPTBrowser(Settings.from_env(tmp_path))._load_all_rendered_messages(StuckPage())
-        assert scan["stable"] is False
-        assert scan["stop_reason"] == "no_scroll_progress"
-        assert scan["iterations"] <= 26
 
-    asyncio.run(run())
+def test_hidden_picker_menus_do_not_block_selection(tmp_path):
+    hidden = '<div role="menu" hidden><span role="slider" aria-valuemin="0" aria-valuemax="4" aria-valuenow="0"></span></div>'
+    async def check(browser, page):
+        effort, value, source = await browser._select_effort(page, "extra_high")
+        assert (effort, value, source) == ("Extra High", 3, "explicit")
+        assert await page.evaluate("window.sent") == 0
+    run_page(tmp_path, hidden + picker() + hidden, check)

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 Mode = Literal["consult", "research", "critic"]
-Quality = Literal["auto", "extra_high", "pro"]
+Quality = Literal["auto", "extra_high", "pro", "low", "medium", "high"]
 State = Literal[
     "QUEUED",
     "STARTING",
@@ -42,6 +42,8 @@ class Job:
     id: str
     mode: Mode
     prompt: str
+    request_id: str | None = None
+    request_intent_sha256: str | None = None
     project: str | None = None
     model: str | None = None
     quality: Quality = "auto"
@@ -69,7 +71,53 @@ class Job:
     result_path: str | None = None
     sources: list[str] = field(default_factory=list)
     assistant_count_before: int = 0
+    user_message_ids_before: list[str] = field(default_factory=list)
+    assistant_message_ids_before: list[str] = field(default_factory=list)
+    submitted_prompt_sha256: str | None = None
+    current_user_message_id: str | None = None
+    current_assistant_message_id: str | None = None
+    submission_state: str = "legacy_unverified"
+    submission_verified_at: str | None = None
+    research_expected: bool = False
+    research_start_state: str | None = None
+    research_user_message_id: str | None = None
+    research_user_prompt_sha256: str | None = None
+    research_assistant_message_id: str | None = None
+    research_observed: bool = False
+    research_state: str | None = None
+    research_run_id: str | None = None
+    research_report_id: str | None = None
+    research_report_complete: bool = False
+    # Freeze before any browser mutation. Caller input remains the request
+    # identity; this body is the one click's actual Web text.
+    sending_text: str | None = None
+    sending_text_sha256: str | None = None
+    sending_text_normalized_sha256: str | None = None
+    oracle_composition_version: str | None = None
+    oracle_prepared_at: str | None = None
+    oracle_bootstrap_version: str | None = None
+    oracle_bootstrap_included: bool = False
+    oracle_mode_overlay_included: bool = False
+    oracle_recovery_reminder_included: bool = False
+    oracle_bootstrap_task_id: str | None = None
+    oracle_bootstrap_user_message_id: str | None = None
+    oracle_bootstrap_verified_at: str | None = None
+    oracle_recovery_pending: bool = False
+    clarification_text: str | None = None
+    user_input_kind: str | None = None
+    cancel_requested_at: str | None = None
+    cancellation_stop_verified: bool | None = None
     attempts: int = 0
+    # Reserve each runtime browser action durably before it occurs. Restarting
+    # a broker must not reset this bounded same-turn recovery budget.
+    runtime_recovery_attempts: int = 0
+    runtime_recovery_actions: list[dict[str, Any]] = field(default_factory=list)
+    # Bounded, secret-scrubbed page evidence (console errors, failed backend
+    # requests, visible runtime alerts) kept after the tab is released.
+    page_probe_events: list[dict[str, Any]] = field(default_factory=list)
+    account_index: int | None = None
+    account_attempts: list[dict[str, Any]] = field(default_factory=list)
+    account_switch: dict[str, Any] | None = None
     # Metadata for the last explicit conversation export.  Export payloads are
     # intentionally not persisted in the task JSON; only this small summary is.
     export_id: str | None = None
@@ -128,8 +176,11 @@ class Job:
 
 
 def public_job(job: Job) -> dict[str, Any]:
+    from .oracle_protocol import public_protocol
+
     return {
         "task_id": job.id,
+        "request_id": job.request_id,
         "mode": job.mode,
         "state": job.state,
         "project": job.project,
@@ -142,6 +193,21 @@ def public_job(job: Job) -> dict[str, Any]:
         "selection_source": job.selection_source,
         "selection_verified_at": job.selection_verified_at,
         "conversation_url": job.conversation_url,
+        "current_user_message_id": job.current_user_message_id,
+        "current_assistant_message_id": job.current_assistant_message_id,
+        "submission_state": job.submission_state,
+        "submission_verified_at": job.submission_verified_at,
+        "research": {
+            "expected": job.research_expected,
+            "observed": job.research_observed,
+            "state": job.research_state,
+            "start_state": job.research_start_state,
+            "run_id": job.research_run_id,
+            "report_id": job.research_report_id,
+            "report_complete": job.research_report_complete,
+        },
+        "cancel_requested_at": job.cancel_requested_at,
+        "cancellation_stop_verified": job.cancellation_stop_verified,
         "session_id": job.session_id,
         "attachments": job.attachments,
         "created_at": job.created_at,
@@ -150,11 +216,20 @@ def public_job(job: Job) -> dict[str, Any]:
         "last_checked_at": job.last_checked_at,
         "progress": job.progress,
         "user_action": job.user_action,
+        "user_input_kind": job.user_input_kind,
+        "clarification_text": job.clarification_text,
+        "oracle_protocol": public_protocol(job),
         "error": job.error,
         "error_code": job.error_code,
         "sources": job.sources,
         "prompt_sha256": job.prompt_sha256,
         "attempts": job.attempts,
+        "runtime_recovery_attempts": job.runtime_recovery_attempts,
+        "runtime_recovery_actions": job.runtime_recovery_actions,
+        "page_probe_events": job.page_probe_events,
+        "account_index": job.account_index,
+        "account_attempts": job.account_attempts,
+        "account_switch": job.account_switch,
         "export_id": job.export_id,
         "exported_at": job.exported_at,
         "export_scope": job.export_scope,
